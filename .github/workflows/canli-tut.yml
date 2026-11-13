@@ -1,0 +1,27 @@
+# GitHub, 60 gün hiç commit almayan HERKESE AÇIK depolarda zamanlanmış işleri
+# kendiliğinden kapatır. Bu depo elle değişmez; yedek ve nöbetçi sessizce
+# durmasın diye ayda bir küçük bir commit atılır (son_canli.txt).
+
+name: Canlı tut
+
+on:
+  schedule:
+    - cron: "5 3 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dokun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          date -u +%F > son_canli.txt
+          git config user.name "nobet-botu"
+          git config user.email "nobet-botu@users.noreply.github.com"
+          git add son_canli.txt
+          git commit -q -m "Canlı tut $(date -u +%F)" || exit 0
+          git push -q

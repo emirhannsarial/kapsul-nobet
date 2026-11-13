@@ -1,0 +1,204 @@
+# Nöbetçi: Supabase uyku önleyici ve sağlık yoklaması (InTimePost).
+#
+# Ücretsiz Supabase projesi 7 gün istek almazsa uyutulur; uyuyan projede
+# açılış bildirimleri de durur. Bu iş projeyi uyanık tutar ve bir şey ters
+# giderse kırmızıya döner: GitHub depo sahibine e-posta atar.
+#
+# Neden bu herkese açık depoda: özel depoların Actions kotası 12 Kasım
+# 2026'da doldu ve nöbetçi de durdu; herkese açık depoda dakika sayılmaz,
+# bu yüzden saatte bir çalışabilir (özelde 2 saatte birdi). Kullanılan
+# anahtar uygulamanın içindeki herkese açık (publishable) anahtardır; çağrılan
+# sağlık fonksiyonları yalnızca sayı/yüzde döndürür. Haftalık rapor (kullanıcı
+# sayıları) bilerek burada DEĞİL: ana özel depoda kalır.
+
+name: Nöbetçi
+
+on:
+  schedule:
+    # Saatte bir, saat başından 17 dakika sonra (tam saatler en yoğun an).
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nobetci
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  yoklama:
+    name: Supabase ayakta mı
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Veritabanına gerçek bir sorgu at
+        env:
+          # Herkese açık (publishable) anahtar; uygulamanın içinde de var.
+          # Gizli anahtar CI'ya hiç girmez.
+          SUPABASE_URL: https://mfqoiwdjuvancjaikuyh.supabase.co
+          SUPABASE_KEY: sb_publishable_6ZrKH-7AtOM0bJ09bBKTgQ_xa7TqP1_
+        run: |
+          set -u
+          # preview_claim, girişsiz de çağrılabilen tek fonksiyon (link
+          # karşılama sayfası için). Bilerek geçersiz bir anahtar veriyoruz:
+          # beklenen cevap HTTP 400 + LINK_INVALID. Yani bu yoklama hem
+          # veritabanını uyandırır hem de hata yolunun çalıştığını doğrular.
+          # Hiçbir veri okunmaz, hiçbir satır yazılmaz.
+          govde=$(mktemp)
+          kod=$(curl --silent --show-error --max-time 20 \
+            --retry 2 --retry-delay 5 --retry-connrefused \
+            --output "$govde" --write-out '%{http_code}' \
+            -X POST "$SUPABASE_URL/rest/v1/rpc/preview_claim" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"p_token":"nobetci-yoklamasi-gecersiz-anahtar"}') || kod="000"
+
+          echo "HTTP $kod"
+          if [ "$kod" != "400" ] || ! grep -q "LINK_INVALID" "$govde"; then
+            echo "::error::Supabase beklenen cevabı vermedi (HTTP $kod)."
+            echo "Proje uyutulmuş, kapalı ya da kurallar değişmiş olabilir."
+            echo "Yapılacak: supabase.com/dashboard'da projeyi aç ve uyandır."
+            echo "--- cevap ---"
+            exit 1
+          fi
+          echo "Supabase ayakta ve hata yolu doğru çalışıyor."
+
+      - name: Bildirimler akıyor mu
+        env:
+          SUPABASE_URL: https://mfqoiwdjuvancjaikuyh.supabase.co
+          SUPABASE_KEY: sb_publishable_6ZrKH-7AtOM0bJ09bBKTgQ_xa7TqP1_
+        run: |
+          set -u
+          # notification_health yalnızca İKİ SAYI döndürür (kimlik, içerik,
+          # anahtar yok). CI'ya service_role anahtarı bilerek konmadı: o
+          # anahtar bütün veritabanı kurallarını aşar (plan 09 §7.1).
+          #   stuck               10 dakikadan uzun süredir gönderilemeyen
+          #   given_up_24h        son 24 saatte 5 denemede de gönderilemeyip
+          #                       vazgeçilen (migration 20260924090000; APNs
+          #                       anahtarı arızası bunu görünmez bırakmıştı)
+          #   minutes_since_cron  zamanlayıcının son başarılı çalışması
+          govde=$(mktemp)
+          kod=$(curl --silent --show-error --max-time 20 --retry 2             --retry-delay 5 --output "$govde" --write-out '%{http_code}'             -X POST "$SUPABASE_URL/rest/v1/rpc/notification_health"             -H "apikey: $SUPABASE_KEY"             -H "Authorization: Bearer $SUPABASE_KEY"             -H "Content-Type: application/json" -d '{}') || kod="000"
+
+          if [ "$kod" = "404" ]; then
+            echo "::warning::Bildirim göndericisi henüz canlıda değil (migration 20260922120000)."
+            exit 0
+          fi
+          if [ "$kod" != "200" ]; then
+            echo "::error::Sağlık sayacı cevap vermedi (HTTP $kod)."
+            exit 1
+          fi
+
+          takili=$(jq -r '.stuck' "$govde")
+          vazgecilen=$(jq -r '.given_up_24h // 0' "$govde")
+          dakika=$(jq -r '.minutes_since_cron // "yok"' "$govde")
+          echo "Takılı bildirim: $takili · son 24 saatte vazgeçilen: $vazgecilen · zamanlayıcının son çalışması: $dakika dk önce"
+          if [ "$dakika" = "yok" ] || [ "$dakika" -gt 10 ]; then
+            echo "::error::Bildirim zamanlayıcısı (pg_cron) çalışmıyor; açılış bildirimleri gitmiyor."
+            exit 1
+          fi
+          if [ "$takili" -gt 0 ]; then
+            echo "::error::$takili bildirim 10 dakikadan uzun süredir gönderilemiyor."
+            echo "Edge Function günlüğüne bak: supabase.com/dashboard → Edge Functions → bildirim-gonder."
+            exit 1
+          fi
+          if [ "$vazgecilen" -gt 0 ]; then
+            echo "::error::Son 24 saatte $vazgecilen bildirim 5 denemede de gönderilemedi ve vazgeçildi."
+            echo "Çoğu zaman sebep Firebase/APNs anahtarıdır (ör. FCM_401_THIRD_PARTY_AUTH_ERROR)."
+            echo "Edge Function günlüğüne bak: supabase.com/dashboard → Edge Functions → bildirim-gonder."
+            echo "Arıza giderildikten sonra bu uyarı, vazgeçilen satırlar 24 saati doldurunca kendiliğinden söner."
+            exit 1
+          fi
+          echo "Bildirimler akıyor."
+
+      - name: Bekleyen acil çocuk güvenliği şikâyeti var mı
+        # Önceki adımlardan biri kırmızıya dönse bile çalışır: acil uyarı
+        # başka bir arızanın arkasında kalmamalı.
+        if: always()
+        # Ayrı bir iş değil, aynı işe bir adım: ek dakika yakmaz.
+        # Plan 12 §2, veri envanteri B16. Kırmızıya dönerse GitHub CEO'ya
+        # e-posta atar; yapılacaklar docs/moderasyon.md'de.
+        env:
+          SUPABASE_URL: https://mfqoiwdjuvancjaikuyh.supabase.co
+          SUPABASE_KEY: sb_publishable_6ZrKH-7AtOM0bJ09bBKTgQ_xa7TqP1_
+        run: |
+          set -u
+          # moderation_health yalnızca İKİ SAYI döndürür: bekleyen acil
+          # şikâyet sayısı ve en eskisinin yaşı (dakika). Kim, kimi, hangi
+          # kapsül yok.
+          govde=$(mktemp)
+          kod=$(curl --silent --show-error --max-time 20 --retry 2 \
+            --retry-delay 5 --output "$govde" --write-out '%{http_code}' \
+            -X POST "$SUPABASE_URL/rest/v1/rpc/moderation_health" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" -d '{}') || kod="000"
+
+          if [ "$kod" != "200" ]; then
+            echo "::error::Acil şikâyet sayacı cevap vermedi (HTTP $kod)."
+            exit 1
+          fi
+
+          acil=$(jq -r '.urgent' "$govde")
+          yas=$(jq -r '.oldest_minutes // 0' "$govde")
+          if [ "$acil" -gt 0 ]; then
+            echo "::error::Bekleyen ACİL çocuk güvenliği şikâyeti var."
+            echo "Hemen docs/moderasyon.md → 'Acil şikâyet' adımlarını uygula."
+            exit 1
+          fi
+          echo "Bekleyen acil şikâyet yok."
+
+      - name: Büyüme alarmı (ücretsiz plan sınırının %70'i)
+        # Önceki adımlar kırmızı olsa bile çalışır. Ayrı iş değil: ek dakika yok.
+        # CEO kararı (30 Eylül 2026): veritabanı, depolama, aylık çıkış ve
+        # Realtime bağlantısı ücretsiz sınırın %70'ine gelince e-posta
+        # (kırmızı adımı GitHub e-postayla bildirir). Ne yapılacağı:
+        # docs/olcekleme.md. `growth_health` yalnızca dört YÜZDE döndürür.
+        # Veritabanı ve depolama ölçülen değerdir; aylık çıkış ve Realtime
+        # tahmindir (Supabase bunları SQL'e açmıyor; formül migration
+        # 20260930270000'de), gerçek değer Supabase > Usage sayfasındadır.
+        if: always()
+        env:
+          SUPABASE_URL: https://mfqoiwdjuvancjaikuyh.supabase.co
+          SUPABASE_KEY: sb_publishable_6ZrKH-7AtOM0bJ09bBKTgQ_xa7TqP1_
+        run: |
+          set -u
+          govde=$(mktemp)
+          kod=$(curl --silent --show-error --max-time 20 --retry 2             --retry-delay 5 --output "$govde" --write-out '%{http_code}'             -X POST "$SUPABASE_URL/rest/v1/rpc/growth_health"             -H "apikey: $SUPABASE_KEY"             -H "Authorization: Bearer $SUPABASE_KEY"             -H "Content-Type: application/json" -d '{}') || kod="000"
+
+          if [ "$kod" = "404" ]; then
+            echo "::warning::Büyüme ölçümü henüz canlıda değil (migration 20260930270000)."
+            exit 0
+          fi
+          if [ "$kod" != "200" ]; then
+            echo "::error::Büyüme sayacı cevap vermedi (HTTP $kod)."
+            exit 1
+          fi
+
+          esik=$(jq -r '.threshold_pct // 70' "$govde")
+          yas=$(jq -r '.age_minutes // "yok"' "$govde")
+          db=$(jq -r '.db_pct // 0' "$govde")
+          dep=$(jq -r '.storage_pct // 0' "$govde")
+          cikis=$(jq -r '.egress_pct // 0' "$govde")
+          rt=$(jq -r '.realtime_pct // 0' "$govde")
+          echo "Doluluk (ücretsiz plana göre %): veritabanı $db · depolama $dep · aylık çıkış (tahmin) $cikis · Realtime (tahmin) $rt · eşik $esik · ölçüm $yas dk önce"
+
+          alarm=0
+          uyar() {
+            if [ "$2" -ge "$esik" ]; then
+              echo "::error::$1 ücretsiz plan sınırının %$2'ine ulaştı (eşik %$esik). Yapılacaklar: docs/olcekleme.md."
+              alarm=1
+            fi
+          }
+          uyar "Veritabanı boyutu" "$db"
+          uyar "Depolama boyutu" "$dep"
+          uyar "Aylık çıkış (tahmin)" "$cikis"
+          uyar "Eşzamanlı Realtime bağlantısı (tahmin)" "$rt"
+          if [ "$yas" = "yok" ] || [ "$yas" -gt 360 ]; then
+            echo "::error::Büyüme ölçümü 6 saattir güncellenmedi (pg_cron işi buyume-olcumu)."
+            alarm=1
+          fi
+          if [ "$alarm" -ne 0 ]; then exit 1; fi
+          echo "Büyüme sınırların altında."

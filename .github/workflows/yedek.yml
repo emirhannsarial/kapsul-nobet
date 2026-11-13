@@ -1,0 +1,63 @@
+# Gece yedeği: InTimePost veritabanı (+ isteğe bağlı fotoğraf/ses dosyaları),
+# parolayla şifrelenip AYRI ÖZEL depoya (kapsul-yedek) yazılır.
+#
+# Neden bu herkese açık depoda: GitHub özel depolarda ayda 2.000 dakika
+# veriyor ve 12 Kasım 2026'da kota doldu; yedek ve nöbetçi de durdu.
+# Herkese açık depoda dakika sayılmaz. Burada uygulama kodu yok; sırlar
+# GitHub'ın şifreli kasasında, yedeklerin kendisi şifreli ve özel depoda.
+# Günlük herkese açık olduğu için betikler ACIK_DEPO=1 ile çalışır: satır ve
+# dosya sayıları, hata ayrıntıları günlüğe yazılmaz.
+#
+# Güvenlik: bu iş yalnızca zamanlayıcıyla ve depo sahibinin elle
+# çalıştırmasıyla başlar; pull_request tetikleyicisi bilerek YOK (çatallardan
+# gelen değişiklik sırlara hiç ulaşamaz).
+
+name: Yedek
+
+on:
+  schedule:
+    # 02:41 UTC = 05:41 Türkiye. Tam saat başı GitHub'da en yoğun an.
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      deneme:
+        description: "Yedekten sonra geri yükleme denemesini de çalıştır"
+        type: boolean
+        default: true
+
+concurrency:
+  group: yedek
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  yedek:
+    name: Gece yedeği
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ACIK_DEPO: "1"
+      YEDEK_DB_URL: ${{ secrets.YEDEK_DB_URL }}
+      YEDEK_SIFRE: ${{ secrets.YEDEK_SIFRE }}
+      YEDEK_DEPO_ANAHTARI: ${{ secrets.YEDEK_DEPO_ANAHTARI }}
+      YEDEK_S3_ANAHTAR: ${{ secrets.YEDEK_S3_ANAHTAR }}
+      YEDEK_S3_GIZLI: ${{ secrets.YEDEK_S3_GIZLI }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Gece yedeği
+        run: bash yedek/gece.sh
+      - name: Bugün geri yükleme denemesi var mı
+        id: deneme
+        env:
+          ELLE: ${{ github.event_name == 'workflow_dispatch' && inputs.deneme }}
+        run: |
+          if [ "$ELLE" = "true" ] || [ "$(date -u +%d)" = "01" ]; then
+            echo "gerek=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gerek=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Geri yükleme denemesi (ayın 1'i ya da elle)
+        if: steps.deneme.outputs.gerek == 'true'
+        run: bash yedek/dene.sh
